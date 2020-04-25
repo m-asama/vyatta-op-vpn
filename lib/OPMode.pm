@@ -89,7 +89,7 @@ sub conv_dh_group {
 
 sub conv_hash {
   my $hash = pop(@_);
-  if ($hash =~ /[^_]*_(.*)/){
+  if ($hash =~ /[^_]*_([^_]*_[^_]*)/){
     $hash = lc($1);
     if ($hash =~ /sha2_(.*)/){
       $hash = "sha".$1;
@@ -573,6 +573,9 @@ sub process_tunnels{
         if ($vpncfg->existsOrig("$peer_path tunnel $tunid esp-group")) {
           $esp_path = "tunnel $tunid esp-group";
         }
+        if ($vpncfg->existsOrig("$peer_path vti esp-group")) {
+          $esp_path = "vti esp-group";
+        }
         my $esp_group = $vpncfg->returnEffectiveValue("$peer_path $esp_path");
         my $ike_group = $vpncfg->returnEffectiveValue("site-to-site peer $tunnel_hash{$connectid}->{_peerid} ike-group");
         my $pfs_group = $vpncfg->returnEffectiveValue("esp-group $esp_group pfs");
@@ -584,12 +587,14 @@ sub process_tunnels{
         $tunnel_hash{$connectid}->{_ikelife} = $ikelife;
         $tunnel_hash{$connectid}->{_pfsgrp} = $pfs_group;
 
-      } elsif ($line =~ /\]:\s+IKE SPIs: .* (reauthentication|rekeying) (disabled|in .*)/) {
-        $tunnel_hash{$connectid}->{_ikeexpire} = conv_time($2);
-        my $atime = $tunnel_hash{$connectid}->{_ikelife} - $tunnel_hash{$connectid}->{_ikeexpire};
-
-        $tunnel_hash{$connectid}->{_ikestate} = "up" if ($atime >= 0);
-
+      } elsif ($line =~ /\]:\s+IKE(v1\/2|v1|v2) SPIs: .* (reauthentication|rekeying) (disabled|in .*)/) {
+        my $_ikeexpire = conv_time($3);
+        if ($tunnel_hash{$connectid}->{_ikeexpire} eq 'n/a'
+         || $tunnel_hash{$connectid}->{_ikeexpire} < $_ikeexpire) {
+          $tunnel_hash{$connectid}->{_ikeexpire} = $_ikeexpire;
+          my $atime = $tunnel_hash{$connectid}->{_ikelife} - $tunnel_hash{$connectid}->{_ikeexpire};
+          $tunnel_hash{$connectid}->{_ikestate} = "up" if ($atime >= 0);
+        }
       } elsif ($line =~ /\]:\s+IKE.proposal:(.*?)\/(.*?)\/(.*?)\/(.*)/) {
         $tunnel_hash{$connectid}->{_ikeencrypt} = $1;
         $tunnel_hash{$connectid}->{_ikehash} = $2;
@@ -599,18 +604,24 @@ sub process_tunnels{
         $esp_hash{$connectid}{$1}->{_inspi} = $2;
         $esp_hash{$connectid}{$1}->{_outspi} = $3;
 
-      } elsif ($line =~ /{(\d+)}:\s+(.*?)\/(.*?), (\d+) bytes_i.* (\d+) bytes_o.*rekeying (disabled|in .*)/) {
+      } elsif ($line =~ /{(\d+)}:\s+(.*?)\/(.*?)(\/(.*?)?), (\d+) bytes_i.* (\d+) bytes_o.*rekeying (disabled|in .*)/) {
         my $esp_id = $1;
-        $esp_hash{$connectid}{$esp_id}->{_encryption} = $2;
-        $esp_hash{$connectid}{$esp_id}->{_hash} = $3;
-        $esp_hash{$connectid}{$esp_id}->{_inbytes} = $4;
-        $esp_hash{$connectid}{$esp_id}->{_outbytes} = $5;
-        $esp_hash{$connectid}{$esp_id}->{_expire} = conv_time($6);
-
-        my $last_used = 1000;
-        $last_used = $1 if ($line =~ /\((\d+)s ago\)/);
-        $esp_hash{$connectid}{$esp_id}->{last_used} = $last_used;
-
+        my $_encryption = $2;
+        my $_hash = $3;
+        my $_inbytes = $6;
+        my $_outbytes = $7;
+        my $_expire = conv_time($8);
+        if ($esp_hash{$connectid}{$esp_id}->{_expire} eq 'n/a'
+         || $esp_hash{$connectid}{$esp_id}->{_expire} < $_expire) {
+          $esp_hash{$connectid}{$esp_id}->{_encryption} = $2;
+          $esp_hash{$connectid}{$esp_id}->{_hash} = $3;
+          $esp_hash{$connectid}{$esp_id}->{_inbytes} = $6;
+          $esp_hash{$connectid}{$esp_id}->{_outbytes} = $7;
+          $esp_hash{$connectid}{$esp_id}->{_expire} = conv_time($8);
+          my $last_used = 1000;
+          $last_used = $1 if ($line =~ /\((\d+)s ago\)/);
+          $esp_hash{$connectid}{$esp_id}->{last_used} = $last_used;
+        }
       } elsif ($line =~ /{(\d+)}:\s+(\d+\.\d+\.\d+\.\d+\/\d+(\[.*?\]){0,1}) === (\d+\.\d+\.\d+\.\d+\/\d+(\[.*?\]){0,1})/) {
         my ($esp_id, $_lsnet, $_lsproto, $_rsnet, $_rsproto) = ($1, $2, $3, $4, $5);
 
@@ -830,8 +841,8 @@ sub get_connection_status
     (my $peerid, my $tun) = @_;
     my %th = get_tunnel_info_peer($peerid);
     for my $peer ( keys %th ) {
-      if (%{$th{$peer}}->{_tunnelnum} eq $tun){
-        return %{$th{$peer}}->{_state};
+      if ($th{$peer}->{_tunnelnum} eq $tun){
+        return $th{$peer}->{_state};
       }
     }
 }
@@ -840,10 +851,10 @@ sub get_peer_ike_status
     my ($peerid) = @_;
     my %th = get_tunnel_info_peer($peerid);
     for my $peer ( keys %th ) {
-      if (%{$th{$peer}}->{_ikestate} eq 'up'){
+      if ($th{$peer}->{_ikestate} eq 'up'){
         return 'up';    
       }
-      if (%{$th{$peer}}->{_ikestate} eq 'init'){
+      if ($th{$peer}->{_ikestate} eq 'init'){
         return 'init';    
       }
     }
@@ -855,14 +866,14 @@ sub show_ipsec_sa_natt
     my %tunnel_hash = get_tunnel_info();
     my %tmphash = ();
     for my $peer ( keys %tunnel_hash ) {
-       if (%{$tunnel_hash{$peer}}->{_natt} == 1 ){
-         $tmphash{$peer} = \%{$tunnel_hash{$peer}};
+       if ($tunnel_hash{$peer}->{_natt} == 1 ){
+         $tmphash{$peer} = $tunnel_hash{$peer};
        }
     }
     display_ipsec_sa_brief(\%tmphash);
 }
 sub show_ike_status{
-  my $process_id = `sudo cat /var/run/pluto.pid`;
+  my $process_id = `sudo cat /var/run/charon.pid`;
   chomp $process_id;
 
   print <<EOS;
@@ -898,8 +909,8 @@ sub show_ike_sa_natt
     my %tunnel_hash = get_tunnel_info();
     my %tmphash = ();
     for my $peer ( keys %tunnel_hash ) {
-      if (%{$tunnel_hash{$peer}}->{_natt} == 1 ){
-        $tmphash{$peer} = \%{$tunnel_hash{$peer}};
+      if ($tunnel_hash{$peer}->{_natt} == 1 ){
+        $tmphash{$peer} = $tunnel_hash{$peer};
       }
     }
     display_ike_sa_brief(\%tmphash);

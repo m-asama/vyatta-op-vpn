@@ -97,8 +97,9 @@ sub relate_intfs_with_localips {
 # main
 #
 
-my $process_id = `sudo cat /var/run/pluto.pid`;
-my $active_tunnels = `sudo ipsec status 2>/dev/null | grep 'newest IPsec SA: #' | grep -v 'newest IPsec SA: #0' | wc -l`;
+my $process_id = `sudo cat /var/run/charon.pid`;
+#my $active_tunnels = `sudo ipsec status 2>/dev/null | grep 'newest IPsec SA: #' | grep -v 'newest IPsec SA: #0' | wc -l`;
+my $active_tunnels = `sudo ipsec status 2>/dev/null | grep 'INSTALLED' | wc -l`;
 chomp $process_id;
 chomp $active_tunnels;
 my @vpn_interfaces = get_vpn_intfs();
