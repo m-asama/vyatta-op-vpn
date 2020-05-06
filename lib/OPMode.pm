@@ -28,15 +28,15 @@ package Vyatta::VPN::OPMode;
 use lib "/opt/vyatta/share/perl5/";
 use Vyatta::VPN::Util;
 use Vyatta::Config;
+use Net::IP;
 use strict;
 
 sub conv_id {
   my $peer = pop(@_);
-  if ( $peer =~ /\d+\.\d+\.\d+\.\d+/ ){
+  my $netipobj = new Net::IP ($peer);
+  if (defined $netipobj and $netipobj->size() == 1) {
     $peer = $peer;
-  } elsif ($peer =~ /\d+\:\d+\:\d+\:\d+\:\d+\:\d+\:\d+\:\d+/){
-    $peer = $peer;
-  } elsif ($peer =~ /\%any/){
+  } elsif ($peer =~ /\%any/) { # XXX: ???
     $peer = "any";
   } else {
     $peer = "\@$peer";
@@ -89,22 +89,36 @@ sub conv_dh_group {
 
 sub conv_hash {
   my $hash = pop(@_);
-  if ($hash =~ /[^_]*_([^_]*_[^_]*)/){
-    $hash = lc($1);
-    if ($hash =~ /sha2_(.*)/){
-      $hash = "sha".$1;
-    }
+  if ($hash eq "HMAC_SHA1_96") {
+    $hash = "sha1";
+  } elsif ($hash eq "HMAC_SHA1_160") {
+    $hash = "sha1_160";
+  } elsif ($hash eq "HMAC_SHA2_256_128") {
+    $hash = "sha256";
+  } elsif ($hash eq "HMAC_SHA2_256_96") {
+    $hash = "sha256_96";
+  } elsif ($hash eq "HMAC_SHA2_384_192") {
+    $hash = "sha384";
+  } elsif ($hash eq "HMAC_SHA2_512_256") {
+    $hash = "sha512";
+  } elsif ($hash eq "HMAC_MD5_96") {
+    $hash = "md5";
+  } elsif ($hash eq "HMAC_MD5_128") {
+    $hash = "md5_128";
   }
   return $hash;
 }
 
 sub conv_enc {
   my $enc = pop(@_);
-  if ($enc =~ /(.*?)_.*?_(.*)/){
-    $enc = lc($1).$2;
-    $enc =~ s/^ //g;
-  } elsif ($enc =~ /3DES/) {
+  if ($enc eq "3DES") {
     $enc = "3des";
+  } elsif ($enc eq "AES_CBC-128") {
+    $enc = "aes128";
+  } elsif ($enc eq "AES_CBC-192") {
+    $enc = "aes192";
+  } elsif ($enc eq "AES_CBC-256") {
+    $enc = "aes256";
   }
   return $enc;
 }
@@ -177,7 +191,8 @@ sub nat_detect {
 
 sub get_tunnel_info {
   #my $cmd = "cat /home/vyatta/test.txt";
-  my $cmd = "sudo ipsec statusall";
+  #my $cmd = "sudo ipsec statusall";
+  my $cmd = "sudo swanctl -l";
   open(my $IPSECSTATUS, ,'-|', $cmd);
   my @ipsecstatus = [];
   while(<$IPSECSTATUS>){
@@ -189,39 +204,142 @@ sub get_tunnel_info {
 sub get_tunnel_info_peer {
   my $peer = pop(@_);
   #my $cmd = "cat /home/vyatta/test.txt | grep peer-$peer";
-  my $cmd = "sudo ipsec statusall | grep peer-$peer-";
+  #my $cmd = "sudo ipsec statusall | grep peer-$peer-";
+  my $cmd = "sudo swanctl -l";
   open(my $IPSECSTATUS, ,'-|', $cmd);
   my @ipsecstatus = [];
   while(<$IPSECSTATUS>){
     push (@ipsecstatus, $_);
   }
-  process_tunnels(\@ipsecstatus);
+  my %tunnel_hash = process_tunnels(\@ipsecstatus);
+  my @delkeys = ();
+  foreach my $key (keys %tunnel_hash) {
+    push (@delkeys, $key) if $key !~ m/^peer-$peer-/;
+  }
+  foreach my $key (@delkeys) {
+    delete $tunnel_hash{$key};
+  }
+  return %tunnel_hash
+}
+
+# set vpn ipsec site-to-site peer 172.16.1.1 ike-group IKE-G
+# set vpn ipsec ike-group IKE-G lifetime 28800
+sub get_ikelife {
+  my $tunnelnum = pop(@_);
+  my $peerid = pop(@_);
+  my $ikelife = 28800;
+  my $cfg = new Vyatta::Config();
+  my $ikeg = $cfg->returnOrigValue("vpn ipsec site-to-site peer $peerid ike-group");
+  if (not defined $ikeg) {
+    return $ikelife;
+  }
+  my $ikel = $cfg->returnOrigValue("vpn ipsec ike-group $ikeg lifetime");
+  if (not defined $ikel) {
+    return $ikelife;
+  }
+  return $ikel;
+}
+
+# set vpn ipsec site-to-site peer 172.16.1.1 default-esp-group ESP-G
+# set vpn ipsec site-to-site peer 172.16.1.1 tunnel 1 esp-group ESP-G
+# set vpn ipsec site-to-site peer 172.16.1.1 vti esp-group ESP-G
+# set vpn ipsec esp-group ESP-G lifetime 3600
+sub get_lifetime {
+  my $tunnelnum = pop(@_);
+  my $peerid = pop(@_);
+  my $lifetime = 3600;
+  my $cfg = new Vyatta::Config();
+  my $espg;
+  if ($tunnelnum eq 'vti') {
+    $espg = $cfg->returnOrigValue("vpn ipsec site-to-site peer $peerid vti esp-group");
+  } else {
+    $espg = $cfg->returnOrigValue("vpn ipsec site-to-site peer $peerid tunnel $tunnelnum esp-group");
+  }
+  if (not defined $espg) {
+    $espg = $cfg->returnOrigValue("vpn ipsec site-to-site peer $peerid default-esp-group");
+  }
+  if (not defined $espg) {
+    return $lifetime;
+  }
+  my $espl = $cfg->returnOrigValue("vpn ipsec esp-group $espg lifetime");
+  if (not defined $espl) {
+    return $lifetime;
+  }
+  return $espl;
 }
 
 sub process_tunnels{
   my @ipsecstatus = @{pop(@_)};
   my %tunnel_hash = ();
   my %esp_hash = ();
+  my ($connectid, $peerid, $tunnelnum, $ikever);
+  my ($lid, $lip, $rid, $rip, $natt, $natsrc, $natdst);
+  my ($ikeencrypt, $ikehash, $dhgrp, $ikeatime, $ikestate);
+  my ($encryption, $hash, $pfsgrp, $atime, $state);
+  my ($inbytes, $inlastused, $outbytes, $outlastused, $lsnet, $rsnet);
+  my ($inspi, $outspi, $ikelife, $lifetime);
   foreach my $line (@ipsecstatus) {
-    if (($line =~ /\"(peer-.*-tunnel-.*?)\"/)){
-      my $connectid = $1;
-      if (($line =~ /\"(peer-.*-tunnel-.*?)\"(\[\d*\])/)){
-        $connectid .= $2;
+    # peer-0.0.0.0-tunnel-10: #2, ESTABLISHED, IKEv1, 1f733a56158a5775_i 6e63432b3eff26f0_r*
+    # peer-0.0.0.0-tunnel-10: #1, ESTABLISHED, IKEv2, 7fb80eb8b105d255_i dc54996ef4f1fc1b_r*
+    # peer-172.16.1.1-tunnel-vti: #5, ESTABLISHED, IKEv1, 6634b929ca9b23d3_i* af764cc626ec7ef4_r
+    # peer-172.16.1.1-tunnel-vti: #1, ESTABLISHED, IKEv2, 52e612a6d30e65c6_i* 1d86f9864dff6836_r
+    if ($line =~ m/^\S+: #/) {
+      $connectid = undef; $peerid = undef; $tunnelnum = undef; $ikever = 'n/a';
+      $lid = 'n/a'; $lip = 'n/a'; $rid = 'n/a'; $rip = 'n/a'; $natt = 0; $natsrc = 'n/a'; $natdst = 'n/a';
+      $ikeencrypt = 'n/a'; $ikehash = 'n/a'; $dhgrp = 'n/a'; $ikeatime = 'n/a'; $ikestate = 'down';
+      $encryption = 'n/a'; $hash = 'n/a'; $pfsgrp = 'n/a'; $atime = 'n/a'; $state = 'down';
+      $inbytes = 'n/a'; $inlastused = 3600; $outbytes = 'n/a'; $outlastused = 3600; $lsnet = 'n/a'; $rsnet = 'n/a';
+      $inspi = 'n/a'; $outspi = 'n/a'; $ikelife = 'n/a'; $lifetime = 'n/a';
+    }
+    if ($line =~ m/^(peer-(.*)-tunnel-(.*)): #.*, ESTABLISHED, (IKEv(1|2))/) {
+      $connectid = $1;
+      $peerid = $2;
+      $tunnelnum = $3;
+      $ikever = $4;
+      $ikelife = get_ikelife($peerid, $tunnelnum);
+      $lifetime = get_lifetime($peerid, $tunnelnum);
+      $peerid = conv_id($peerid);
+    }
+    #   local  '172.16.2.1' @ 172.16.2.1[4500]
+    if ($line =~ m/^  local  '([^']+)' \@ ([^\[]+)\[([^\]]+)\]/) {
+      $lid = conv_id($1);
+      $lip = $2;
+      $natsrc = $3;
+    }
+    #   remote '172.16.1.1' @ 172.16.1.1[4500]
+    if ($line =~ m/^  remote '([^']+)' \@ ([^\[]+)\[([^\]]+)\]/) {
+      $rid = conv_id($1);
+      $rip = $2;
+      $natdst = $3;
+    }
+    #   AES_CBC-256/HMAC_SHA2_256_128/PRF_HMAC_SHA2_256/MODP_1024
+    if ($line =~ m/^  [^\/\s]+\/[^\/\s]+\/[^\/\s]+/) {
+      $line =~ s/\/PPK//;
+      if ($line =~ m/^  ([^\/\s]+)(\/([^\/\s]+))?\/([^\/\s]+)\/([^\/\s]+)/) {
+        $ikeencrypt = conv_enc($1);
+        $ikehash = conv_hash($3);
+        $dhgrp = conv_dh_group($5);
       }
-      $connectid =~ /peer-(.*)-tunnel-(.*)/;
-      my $peer = $1;
-      my $tunid = $2;
-      $peer = conv_id($peer);
-      if (not exists $tunnel_hash{$connectid}){
+    }
+    #   established 5s ago, rekeying in 28141s
+    if ($line =~ m/^  established (\d+)s ago/) {
+      $ikeatime = $1;
+      $ikestate = 'up';
+      if (defined $connectid
+        and (not exists $tunnel_hash{$connectid}
+          or ($tunnel_hash{$connectid}->{_ikestate} ne $ikestate)
+          or ($tunnel_hash{$connectid}->{_inlastused} > $inlastused)
+          or ($tunnel_hash{$connectid}->{_outlastused} > $outlastused))) {
         $tunnel_hash{$connectid} = {
-                  _peerid      => $peer,
-                  _tunnelnum   => $tunid,
-                  _lip         => 'n/a',
-                  _rip         => 'n/a',
-                  _lid         => 'n/a',
-                  _rid         => 'n/a',
-                  _lsnet       => 'n/a',
-                  _rsnet       => 'n/a',
+                  _peerid      => $peerid,
+                  _tunnelnum   => $tunnelnum,
+                  _ikever      => $ikever,
+                  _lip         => $lip,
+                  _rip         => $rip,
+                  _lid         => $lid,
+                  _rid         => $rid,
+                  _lsnet       => $lsnet,
+                  _rsnet       => $rsnet,
                   _lproto      => 'all',
                   _rproto      => 'all',
                   _lport       => 'all',
@@ -230,295 +348,109 @@ sub process_tunnels{
                   _rca         => undef,
                   _newestspi   => 'n/a',
                   _newestike   => 'n/a',
-                  _encryption  => 'n/a',
-                  _hash        => 'n/a',
-                  _inspi       => 'n/a',
-                  _outspi      => 'n/a',
-                  _pfsgrp      => 'n/a',
-                  _ikeencrypt  => 'n/a',
-                  _ikehash     => 'n/a',
-                  _natt        => 'n/a',
-                  _natsrc      => 'n/a',
-                  _natdst      => 'n/a',
-                  _ikestate    => "down",
-                  _dhgrp       => 'n/a',
-                  _state       => "down",
-                  _inbytes     => 'n/a',
-                  _outbytes    => 'n/a',
-                  _ikelife     => 'n/a',
+                  _encryption  => $encryption,
+                  _hash        => $hash,
+                  _inspi       => $inspi,
+                  _outspi      => $outspi,
+                  _pfsgrp      => $pfsgrp,
+                  _ikeencrypt  => $ikeencrypt,
+                  _ikehash     => $ikehash,
+                  _natt        => $natt,
+                  _natsrc      => $natsrc,
+                  _natdst      => $natdst,
+                  _ikestate    => $ikestate,
+                  _dhgrp       => $dhgrp,
+                  _state       => $state,
+                  _inbytes     => $inbytes,
+                  _inlastused  => $inlastused,
+                  _outbytes    => $outbytes,
+                  _outlastused => $outlastused,
+                  _ikelife     => $ikelife,
+                  _ikeatime    => $ikeatime,
                   _ikeexpire   => 'n/a',
-                  _lifetime    => 'n/a',
+                  _lifetime    => $lifetime,
+                  _atime       => $atime,
                   _expire      => 'n/a' };
       }
-      $line =~ s/---.*\.\.\./.../g; # remove the next hop router for local-ip 0.0.0.0 case
-      if ($line =~ /IKE.proposal:(.*?)\/(.*?)\/(.*)/){
-        $tunnel_hash{$connectid}->{_ikeencrypt} = $1;
-        $tunnel_hash{$connectid}->{_ikehash} = $2;
-        $tunnel_hash{$connectid}->{_dhgrp} = $3;
+    }
+    #   peer-172.16.1.1-tunnel-10: #1, reqid 1, INSTALLED, TUNNEL, ESP:AES_CBC-256/HMAC_SHA2_256_128/MODP_1024
+    #   peer-172.16.1.1-tunnel-11: #2, reqid 2, INSTALLED, TUNNEL, ESP:AES_CBC-256/HMAC_SHA2_256_128/MODP_1024
+    #   peer-172.16.1.1-tunnel-10: #3, reqid 1, INSTALLED, TUNNEL, ESP:AES_CBC-256/HMAC_SHA2_256_128
+    #   peer-172.16.1.1-tunnel-vti: #5, reqid 3, REKEYED, TUNNEL, ESP:AES_CBC-256/HMAC_SHA2_256_128/MODP_1024
+    #   peer-172.16.1.1-tunnel-vti: #6, reqid 3, INSTALLED, TUNNEL, ESP:AES_CBC-256/HMAC_SHA2_256_128/MODP_1024
+    #   peer-0.0.0.0-tunnel-10: #1, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-256/HMAC_SHA2_256_128/MODP_1024
+    if ($line =~ m/^  (\S+): #/) {
+      $connectid = undef; $peerid = undef; $tunnelnum = undef;
+      if ($1 !~ m/peer-.*-tunnel-.*/) {
+        $ikever = 'n/a';
+        $lid = 'n/a'; $lip = 'n/a'; $rid = 'n/a'; $rip = 'n/a'; $natt = 0; $natsrc = 'n/a'; $natdst = 'n/a';
+        $ikeencrypt = 'n/a'; $ikehash = 'n/a'; $dhgrp = 'n/a'; $ikeatime = 'n/a'; $ikestate = 'down';
       }
-      # both subnets
-      elsif ($line =~ /: (.*?)===(.*?)\[(.*?)\]\.\.\.(.*?)\[(.*?)\]===(.*?);/){
-        my $lsnet = $1;
-        my $lip = $2;
-        my $lid = $3;
-        my $rip = $4;
-        my $rid = $5;
-        my $rsnet = $6;
-        ($lip, my $natt, my $natsrc, $rip, my $natdst) = nat_detect($lip, $rip);
-        $tunnel_hash{$connectid}->{_lid} = conv_id($lid);
-        $tunnel_hash{$connectid}->{_lip} = $lip;
-        $tunnel_hash{$connectid}->{_lsnet} = $lsnet;
-        $tunnel_hash{$connectid}->{_rid} = conv_id($rid);
-        $tunnel_hash{$connectid}->{_rip} = $rip;
-        $tunnel_hash{$connectid}->{_rsnet} = $rsnet;
-        $tunnel_hash{$connectid}->{_natt} = $natt;
-        $tunnel_hash{$connectid}->{_natsrc} = $natsrc;
-        $tunnel_hash{$connectid}->{_natdst} = $natdst;
+      $natt = 0;
+      $encryption = 'n/a'; $hash = 'n/a'; $pfsgrp = 'n/a'; $atime = 'n/a'; $state = 'down';
+      $inbytes = 'n/a'; $inlastused = 3600; $outbytes = 'n/a'; $outlastused = 3600; $lsnet = 'n/a'; $rsnet = 'n/a';
+      $inspi = 'n/a'; $outspi = 'n/a'; $ikelife = 'n/a'; $lifetime = 'n/a';
+    }
+    if ($line =~ m/^  (peer-(.*)-tunnel-(.*)): #.*, INSTALLED, (TUNNEL(-in-UDP)?), ESP:(.+)/) {
+      $connectid = $1;
+      $peerid = $2;
+      $tunnelnum = $3;
+      $ikelife = get_ikelife($peerid, $tunnelnum);
+      $lifetime = get_lifetime($peerid, $tunnelnum);
+      $peerid = conv_id($peerid);
+      if ($4 eq 'TUNNEL-in-UDP') {
+        $natt = 1;
       }
-      #left subnet
-      elsif ($line =~ /: (.*?)\[(.*?)\]\.\.\.(.*?)\[(.*?)\];/){
-        my $lip = $1;
-        my $lid = $2;
-        my $rip = $3;
-        my $rid = $4;
-        my $lsnet;
-        if ($lip =~ /(.*?)===(.*)/){
-          $lsnet = $1;
-          $lip = $2;
-        }
-        ($lip, my $natt, my $natsrc, $rip, my $natdst) = nat_detect($lip, $rip);
-        $tunnel_hash{$connectid}->{_lid} = conv_id($lid);
-        $tunnel_hash{$connectid}->{_lip} = $lip;
-        $tunnel_hash{$connectid}->{_rid} = conv_id($rid);
-        $tunnel_hash{$connectid}->{_rip} = $rip;
-        $tunnel_hash{$connectid}->{_natt} = $natt;
-        $tunnel_hash{$connectid}->{_natsrc} = $natsrc;
-        $tunnel_hash{$connectid}->{_natdst} = $natdst;
-        $tunnel_hash{$connectid}->{_lsnet} = $lsnet if (defined($lsnet));
+      my $algs = $6;
+      $algs =~ s/\/ESN//;
+      if ($algs =~ m/^([^\/\s]+)\/([^\/\s]+)(\/([^\/\s]+))?/) {
+        $encryption = conv_enc($1);
+        $hash = conv_hash($2);
+        $pfsgrp = conv_dh_group($4);
       }
-      #left subnet with protocols
-      elsif ($line =~ /: (.*?)\[(.*?)\]:(\d+)\/(\d+)\.\.\.(.*?)\[(.*?)\]:(\d+)\/(\d+);/){
-        my $lip = $1;
-        my $lsnet;
-        my $lid = $2;
-        my $lproto = conv_protocol($3);
-        my $lport = $4;
-        my $rip = $5;
-        my $rid = $6;
-        my $rproto = conv_protocol($7);
-        my $rport = $8;
-        if ($lip =~ /(.*?)===(.*)/){
-          $lsnet = $1;
-          $lip = $2;
-        }
-        ($lip, my $natt, my $natsrc, $rip, my $natdst) = nat_detect($lip, $rip);
-        $tunnel_hash{$connectid}->{_lid} = conv_id($lid);
-        $tunnel_hash{$connectid}->{_lip} = $lip;
-        $tunnel_hash{$connectid}->{_lsnet} = $lsnet if (defined($lsnet));
-        $tunnel_hash{$connectid}->{_rid} = conv_id($rid);
-        $tunnel_hash{$connectid}->{_rip} = $rip;
-        $tunnel_hash{$connectid}->{_natt} = $natt;
-        $tunnel_hash{$connectid}->{_natsrc} = $natsrc;
-        $tunnel_hash{$connectid}->{_natdst} = $natdst;
-        $tunnel_hash{$connectid}->{_lproto} = "$lproto";
-        $tunnel_hash{$connectid}->{_rproto} = "$rproto";
-        $tunnel_hash{$connectid}->{_lport} = "$lport";
-        $tunnel_hash{$connectid}->{_rport} = "$rport";
-      } 
-      # both proto/port and subnets
-      elsif ($line =~ /: (.*)===(.*?)\[(.*?)\]:(\d+)\/(\d+)\.\.\.(.*?)\[(.*?)\]:(\d+)\/(\d+)===(.*?);/){
-        my $lsnet = $1;
-        my $lip = $2;
-        my $lid = $3;
-        my $lproto = conv_protocol($4);
-        my $lport = $5;
-        my $rip = $6;
-        my $rid = $7;
-        my $rproto = conv_protocol($8);
-        my $rport = $9;
-        my $rsnet = $10;
-        my $lprotoport;
-        my $rprotoport;
-        $lprotoport = $lproto if ($lport == 0);
-        $lprotoport = "$lproto/$lport" if ($lport != 0);
-        $rprotoport = $rproto if ($rport == 0);
-        $rprotoport = "$rproto/$rport" if ($rport != 0);
-        ($lip, my $natt, my $natsrc, $rip, my $natdst) = nat_detect($lip, $rip);
-        $tunnel_hash{$connectid}->{_lid} = conv_id($lid);
-        $tunnel_hash{$connectid}->{_lip} = $lip;
-        $tunnel_hash{$connectid}->{_lsnet} = $lsnet;
-        $tunnel_hash{$connectid}->{_rid} = conv_id($rid);
-        $tunnel_hash{$connectid}->{_rip} = $rip;
-        $tunnel_hash{$connectid}->{_rsnet} = $rsnet;
-        $tunnel_hash{$connectid}->{_lproto} = "$lproto";
-        $tunnel_hash{$connectid}->{_rproto} = "$rproto";
-        $tunnel_hash{$connectid}->{_lport} = "$lport";
-        $tunnel_hash{$connectid}->{_rport} = "$rport";
-        $tunnel_hash{$connectid}->{_natt} = $natt;
-        $tunnel_hash{$connectid}->{_natsrc} = $natsrc;
-        $tunnel_hash{$connectid}->{_natdst} = $natdst;
-      }
-      # right proto/port only with subnet
-      elsif ($line =~ /: (.*)===(.*?)\[(.*?)\]\.\.\.(.*?)\[(.*?)\]:(\d+)\/(\d+)===(.*?);/){
-        my $lsnet = $1;
-        my $lip = $2;
-        my $lid = $3;
-        my $rip = $4;
-        my $rid = $5;
-        my $rproto = conv_protocol($6);
-        my $rport = $7;
-        my $rsnet = $8;
-        my $lprotoport;
-        my $rprotoport;
-        $rprotoport = $rproto if ($rport == 0);
-        $rprotoport = "$rproto/$rport" if ($rport != 0);
-        ($lip, my $natt, my $natsrc, $rip, my $natdst) = nat_detect($lip, $rip);
-        $tunnel_hash{$connectid}->{_lid} = conv_id($lid);
-        $tunnel_hash{$connectid}->{_lip} = $lip;
-        $tunnel_hash{$connectid}->{_lsnet} = $lsnet;
-        $tunnel_hash{$connectid}->{_rid} = conv_id($rid);
-        $tunnel_hash{$connectid}->{_rip} = $rip;
-        $tunnel_hash{$connectid}->{_rsnet} = $rsnet;
-        $tunnel_hash{$connectid}->{_rproto} = "$rproto";
-        $tunnel_hash{$connectid}->{_rport} = "$rport";
-        $tunnel_hash{$connectid}->{_natt} = $natt;
-        $tunnel_hash{$connectid}->{_natsrc} = $natsrc;
-        $tunnel_hash{$connectid}->{_natdst} = $natdst;
-      }
-      # left proto/port only with subnet
-      elsif ($line =~ /: (.*)===(.*?)\[(.*?)\]:(\d+)\/(\d+)\.\.\.(.*?)\[(.*?)\]===(.*?);/){
-        my $lsnet = $1;
-        my $lip = $2;
-        my $lid = $3;
-        my $lproto = conv_protocol($4);
-        my $lport = $5;
-        my $rip = $6;
-        my $rid = $7;
-        my $rsnet = $8;
-        my $lprotoport;
-        my $rprotoport;
-        $lprotoport = $lproto if ($lport == 0);
-        $lprotoport = "$lproto/$lport" if ($lport != 0);
-        ($lip, my $natt, my $natsrc, $rip, my $natdst) = nat_detect($lip, $rip);
-        $tunnel_hash{$connectid}->{_lid} = conv_id($lid);
-        $tunnel_hash{$connectid}->{_lip} = $lip;
-        $tunnel_hash{$connectid}->{_lsnet} = $lsnet;
-        $tunnel_hash{$connectid}->{_rid} = conv_id($rid);
-        $tunnel_hash{$connectid}->{_rip} = $rip;
-        $tunnel_hash{$connectid}->{_rsnet} = $rsnet;
-        $tunnel_hash{$connectid}->{_lproto} = "$lproto";
-        $tunnel_hash{$connectid}->{_lport} = "$lport";
-        $tunnel_hash{$connectid}->{_natt} = $natt;
-        $tunnel_hash{$connectid}->{_natsrc} = $natsrc;
-        $tunnel_hash{$connectid}->{_natdst} = $natdst;
-      }
-      elsif ($line =~ /ESP.proposal:(.*?)\/(.*?)\/(.*)/){
-        $tunnel_hash{$connectid}->{_encryption} = $1;
-        $tunnel_hash{$connectid}->{_hash} = $2;
-        $tunnel_hash{$connectid}->{_pfsgrp} = $3;
-      }
-      elsif ($line =~ /STATE_MAIN_I1/){
-        $tunnel_hash{$connectid}->{_ikestate} = "init";
-      }
-      elsif ($line =~ /newest ISAKMP SA: (.*); newest IPsec SA: (.*);/){
-        if ($tunnel_hash{$connectid}->{_newestike} ne 'n/a'){
-          if ($tunnel_hash{$connectid}->{_newestike} lt $1){
-            $tunnel_hash{$connectid}->{_newestike} = $1;
-          }
-        } else {
-          $tunnel_hash{$connectid}->{_newestike} = $1;
-        } 
-        if ($tunnel_hash{$connectid}->{_newestspi} ne 'n/a'){
-          if ($tunnel_hash{$connectid}->{newestspi} lt $2){
-            $tunnel_hash{$connectid}->{_newestspi} = $2;
-          }
-        } else {
-          $tunnel_hash{$connectid}->{_newestspi} = $2;
-        }
-      }
-      elsif ($line =~ /ike_life: (.*?)s; ipsec_life: (.*?)s;/){
-        $tunnel_hash{$connectid}->{_ikelife} = $1;
-        $tunnel_hash{$connectid}->{_lifetime} = $2;
-      }
-      elsif ($line=~ /CAs: (.*?)\.\.\.(.*)/){
-        $tunnel_hash{$connectid}->{_lca} = $1;
-        $tunnel_hash{$connectid}->{_rca} = $2;
-      }
-      my $ike = $tunnel_hash{$connectid}->{_newestike};
-      if ($ike ne 'n/a'){
-        if ($line =~ /$ike:.*ISAKMP.SA.established.*EVENT_SA_REPLACE.in.(.*?)s;/)
-        {
-          $tunnel_hash{$connectid}->{_ikeexpire} = $1;
-          my $atime = $tunnel_hash{$connectid}->{_ikelife} - 
-                      $tunnel_hash{$connectid}->{_ikeexpire};
-          if ($atime >= 0){
-            $tunnel_hash{$connectid}->{_ikestate} = "up";
-          }
-        }
-        if ($line =~ /$ike:.*ISAKMP.SA.established.*EVENT_SA_EXPIRE.in.(.*?)s;/)
-        {
-          $tunnel_hash{$connectid}->{_ikeexpire} = $1;
-          my $atime = $tunnel_hash{$connectid}->{_ikelife} - 
-                      $tunnel_hash{$connectid}->{_ikeexpire};
-          if ($atime >= 0){
-            $tunnel_hash{$connectid}->{_ikestate} = "up";
-          }
-        }
-      }
-      my $spi = $tunnel_hash{$connectid}->{_newestspi};
-      if ($spi ne 'n/a'){
-        if ($line =~ /$spi:.*esp.(.*)\@.*\((.*)bytes.*esp.(.*)\@.*/){
-          $tunnel_hash{$connectid}->{_outspi} = $1;
-          $tunnel_hash{$connectid}->{_outbytes} = $2;
-          $tunnel_hash{$connectid}->{_inspi} = $3;
-        }
-        if ($line =~ /$spi:.*esp.(.*)\@.*esp.(.*)\@.*\((.*)bytes/){
-          $tunnel_hash{$connectid}->{_outspi} = $1;
-          $tunnel_hash{$connectid}->{_inspi} = $2;
-          $tunnel_hash{$connectid}->{_inbytes} = $3;
-        }
-        if ($line =~ /$spi:.*esp.(.*)\@.*\((.*)bytes.*esp.(.*)\@.*\((.*)bytes/)
-        {
-          $tunnel_hash{$connectid}->{_outspi} = $1;
-          $tunnel_hash{$connectid}->{_outbytes} = $2;
-          $tunnel_hash{$connectid}->{_inspi} = $3;
-          $tunnel_hash{$connectid}->{_inbytes} = $4;
-        }
-        if ($line =~ /$spi:.*?EVENT_SA_REPLACE.*? in (.*?)s;/){
-          $tunnel_hash{$connectid}->{_expire} = $1;
-          my $atime = $tunnel_hash{$connectid}->{_lifetime} - 
-                      $tunnel_hash{$connectid}->{_expire};
-          if ($atime >= 0){
-            $tunnel_hash{$connectid}->{_state} = "up";
-          } 
-        }
-        if ($line =~ /$spi:.*?EVENT_SA_EXPIRE in (.*?)s;/){
-          $tunnel_hash{$connectid}->{_expire} = $1;
-          my $atime = $tunnel_hash{$connectid}->{_lifetime} - 
-                      $tunnel_hash{$connectid}->{_expire};
-          if ($atime >= 0){
-            $tunnel_hash{$connectid}->{_state} = "up";
-          } 
-        }
-      }
-    } elsif ($line =~ /^(peer-.*-tunnel-.*?)[{\[].*:\s+/) {
-      my $connectid = $1;
-      $connectid .= $2 if ($line =~ /(peer-.*-tunnel-.*?):(\[\d*\])/);
-      $connectid =~ /peer-(.*)-tunnel-(.*)/;
-      
-      my ($peer, $tunid) = ($1, $2);
-      $peer = conv_id($peer);
-
-      if (not exists $tunnel_hash{$connectid}){
+    }
+    #     installed 72s ago, rekeying in 2554s, expires in 3528s
+    #     installed 8s ago
+    if ($line =~ m/^    installed (\d+)s ago/) {
+      $atime = $1;
+      $state = 'up';
+    }
+    #     in  c7a5807e,      0 bytes,     0 packets
+    #     in  cf6340f7,    588 bytes,     7 packets,     0s ago
+    if ($line =~ m/^    in  ([0-9a-f]+)?.*,\s+(\d+) bytes,\s+(\d+) packets(,\s+(\d+)s ago)?/) {
+      $inspi = $1;
+      $inbytes = $2;
+      $inlastused = $5 if defined $5;
+    }
+    #     out c1f127f5,      0 bytes,     0 packets
+    #     out cbd9e925,    588 bytes,     7 packets,     0s ago
+    if ($line =~ m/^    out ([0-9a-f]+)?.*,\s+(\d+) bytes,\s+(\d+) packets(,\s+(\d+)s ago)?/) {
+      $outspi = $1;
+      $outbytes = $2;
+      $outlastused = $5 if defined $5;
+    }
+    #     local  192.168.22.0/24
+    if ($line =~ m/^    local  (\S+)/) {
+      $lsnet = $1;
+    }
+    #     remote 192.168.2.0/24
+    if ($line =~ m/^    remote (\S+)/) {
+      $rsnet = $1;
+      if (defined $connectid
+        and (not exists $tunnel_hash{$connectid}
+          or ($tunnel_hash{$connectid}->{_state} ne $state)
+          or ($tunnel_hash{$connectid}->{_inlastused} > $inlastused)
+          or ($tunnel_hash{$connectid}->{_outlastused} > $outlastused))) {
         $tunnel_hash{$connectid} = {
-                  _peerid      => $peer,
-                  _tunnelnum   => $tunid,
-                  _lip         => 'n/a',
-                  _rip         => 'n/a',
-                  _lid         => 'n/a',
-                  _rid         => 'n/a',
-                  _lsnet       => 'n/a',
-                  _rsnet       => 'n/a',
+                  _peerid      => $peerid,
+                  _tunnelnum   => $tunnelnum,
+                  _ikever      => $ikever,
+                  _lip         => $lip,
+                  _rip         => $rip,
+                  _lid         => $lid,
+                  _rid         => $rid,
+                  _lsnet       => $lsnet,
+                  _rsnet       => $rsnet,
                   _lproto      => 'all',
                   _rproto      => 'all',
                   _lport       => 'all',
@@ -527,142 +459,143 @@ sub process_tunnels{
                   _rca         => undef,
                   _newestspi   => 'n/a',
                   _newestike   => 'n/a',
-                  _encryption  => 'n/a',
-                  _hash        => 'n/a',
-                  _inspi       => 'n/a',
-                  _outspi      => 'n/a',
-                  _pfsgrp      => 'n/a',
-                  _ikeencrypt  => 'n/a',
-                  _ikehash     => 'n/a',
-                  _natt        => 'n/a',
-                  _natsrc      => 'n/a',
-                  _natdst      => 'n/a',
-                  _ikestate    => "down",
-                  _dhgrp       => 'n/a',
-                  _state       => "down",
-                  _inbytes     => 'n/a',
-                  _outbytes    => 'n/a',
-                  _ikelife     => 'n/a',
+                  _encryption  => $encryption,
+                  _hash        => $hash,
+                  _inspi       => $inspi,
+                  _outspi      => $outspi,
+                  _pfsgrp      => $pfsgrp,
+                  _ikeencrypt  => $ikeencrypt,
+                  _ikehash     => $ikehash,
+                  _natt        => $natt,
+                  _natsrc      => $natsrc,
+                  _natdst      => $natdst,
+                  _ikestate    => $ikestate,
+                  _dhgrp       => $dhgrp,
+                  _state       => $state,
+                  _inbytes     => $inbytes,
+                  _inlastused  => $inlastused,
+                  _outbytes    => $outbytes,
+                  _outlastused => $outlastused,
+                  _ikelife     => $ikelife,
+                  _ikeatime    => $ikeatime,
                   _ikeexpire   => 'n/a',
-                  _lifetime    => 'n/a',
+                  _lifetime    => $lifetime,
+                  _atime       => $atime,
                   _expire      => 'n/a' };
-      }
-
-      $line =~ s/---.*\.\.\./.../g; # remove the next hop router for local-ip 0.0.0.0 case
-
-      if ($line =~ /:\s+ESTABLISHED (.*), (.*?)\[(.*?)\]\.\.\.(.*?)\[(.*?)\]/) {
-        my $lip = $2;
-        my $lid = $3;
-        my $rip = $4;
-        my $rid = $5;
-        ($lip, my $natt, my $natsrc, $rip, my $natdst) = nat_detect($lip, $rip);
-        
-        $tunnel_hash{$connectid}->{_lid} = conv_id($lid);
-        $tunnel_hash{$connectid}->{_lip} = $lip;
-        $tunnel_hash{$connectid}->{_rid} = conv_id($rid);
-        $tunnel_hash{$connectid}->{_rip} = $rip;
-        $tunnel_hash{$connectid}->{_natt} = $natt;
-        $tunnel_hash{$connectid}->{_natsrc} = $natsrc;
-        $tunnel_hash{$connectid}->{_natdst} = $natdst;
-
-        # Pull stuff from running config (IKE/ESP lifetime, PFS group)
-        my $vpncfg = new Vyatta::Config();
-        $vpncfg->setLevel('vpn ipsec');
-        my $esp_path = "default-esp-group";
-        my $peer_path = "site-to-site peer $tunnel_hash{$connectid}->{_peerid}";
-        if ($vpncfg->existsOrig("$peer_path tunnel $tunid esp-group")) {
-          $esp_path = "tunnel $tunid esp-group";
-        }
-        if ($vpncfg->existsOrig("$peer_path vti esp-group")) {
-          $esp_path = "vti esp-group";
-        }
-        my $esp_group = $vpncfg->returnEffectiveValue("$peer_path $esp_path");
-        my $ike_group = $vpncfg->returnEffectiveValue("site-to-site peer $tunnel_hash{$connectid}->{_peerid} ike-group");
-        my $pfs_group = $vpncfg->returnEffectiveValue("esp-group $esp_group pfs");
-        $pfs_group = "default" if ($pfs_group eq 'enable');
-        my $lifetime = $vpncfg->returnEffectiveValue("esp-group $esp_group lifetime");
-        my $ikelife = $vpncfg->returnEffectiveValue("ike-group $ike_group lifetime");
-
-        $tunnel_hash{$connectid}->{_lifetime} = $lifetime;
-        $tunnel_hash{$connectid}->{_ikelife} = $ikelife;
-        $tunnel_hash{$connectid}->{_pfsgrp} = $pfs_group;
-
-      } elsif ($line =~ /\]:\s+IKE(v1\/2|v1|v2) SPIs: .* (reauthentication|rekeying) (disabled|in .*)/) {
-        my $_ikeexpire = conv_time($3);
-        if ($tunnel_hash{$connectid}->{_ikeexpire} eq 'n/a'
-         || $tunnel_hash{$connectid}->{_ikeexpire} < $_ikeexpire) {
-          $tunnel_hash{$connectid}->{_ikeexpire} = $_ikeexpire;
-          my $atime = $tunnel_hash{$connectid}->{_ikelife} - $tunnel_hash{$connectid}->{_ikeexpire};
-          $tunnel_hash{$connectid}->{_ikestate} = "up" if ($atime >= 0);
-        }
-      } elsif ($line =~ /\]:\s+IKE.proposal:(.*?)\/(.*?)\/(.*?)\/(.*)/) {
-        $tunnel_hash{$connectid}->{_ikeencrypt} = $1;
-        $tunnel_hash{$connectid}->{_ikehash} = $2;
-        $tunnel_hash{$connectid}->{_dhgrp} = $4;
-      
-      } elsif ($line =~ /{(\d+)}:\s+INSTALLED.*ESP.*SPIs: (.*)_i (.*)_o/) {
-        $esp_hash{$connectid}{$1}->{_inspi} = $2;
-        $esp_hash{$connectid}{$1}->{_outspi} = $3;
-
-      } elsif ($line =~ /{(\d+)}:\s+(.*?)\/(.*?)(\/(.*?)?), (\d+) bytes_i.* (\d+) bytes_o.*rekeying (disabled|in .*)/) {
-        my $esp_id = $1;
-        my $_encryption = $2;
-        my $_hash = $3;
-        my $_inbytes = $6;
-        my $_outbytes = $7;
-        my $_expire = conv_time($8);
-        if ($esp_hash{$connectid}{$esp_id}->{_expire} eq 'n/a'
-         || $esp_hash{$connectid}{$esp_id}->{_expire} < $_expire) {
-          $esp_hash{$connectid}{$esp_id}->{_encryption} = $2;
-          $esp_hash{$connectid}{$esp_id}->{_hash} = $3;
-          $esp_hash{$connectid}{$esp_id}->{_inbytes} = $6;
-          $esp_hash{$connectid}{$esp_id}->{_outbytes} = $7;
-          $esp_hash{$connectid}{$esp_id}->{_expire} = conv_time($8);
-          my $last_used = 1000;
-          $last_used = $1 if ($line =~ /\((\d+)s ago\)/);
-          $esp_hash{$connectid}{$esp_id}->{last_used} = $last_used;
-        }
-      } elsif ($line =~ /{(\d+)}:\s+(\d+\.\d+\.\d+\.\d+\/\d+(\[.*?\]){0,1}) === (\d+\.\d+\.\d+\.\d+\/\d+(\[.*?\]){0,1})/) {
-        my ($esp_id, $_lsnet, $_lsproto, $_rsnet, $_rsproto) = ($1, $2, $3, $4, $5);
-
-        if (defined($_lsproto)) {
-          $_lsnet =~ s/\Q$_lsproto\E//g if ($_lsnet =~ /\Q$_lsproto\E/);
-          $_lsproto =~ s/\[|\]//g;
-        } else {
-          $_lsproto = "all";
-        }
-
-        if (defined($_rsproto)) {
-          $_rsnet =~ s/\Q$_rsproto\E//g if ($_rsnet =~ /\Q$_rsproto\E/);
-          $_rsproto =~ s/\[|\]//g;
-        } else {
-          $_rsproto = "all";
-        }
-
-        $esp_hash{$connectid}{$esp_id}->{_lsnet} = $_lsnet;
-        $esp_hash{$connectid}{$esp_id}->{_lproto} = $_lsproto;
-        $esp_hash{$connectid}{$esp_id}->{_rsnet} = $_rsnet;
-        $esp_hash{$connectid}{$esp_id}->{_rproto} = $_rsproto;
       }
     }
   }
 
   # Cleanse esp_hash
-  foreach my $connectid (keys %esp_hash) {
-    foreach my $esp_sa (keys %{$esp_hash{$connectid}}) {
-      delete $esp_hash{$connectid}{$esp_sa} if (not defined($esp_hash{$connectid}{$esp_sa}{last_used}));
-    }
-  }
+#  foreach my $connectid (keys %esp_hash) {
+#    foreach my $esp_sa (keys %{$esp_hash{$connectid}}) {
+#      delete $esp_hash{$connectid}{$esp_sa} if (not defined($esp_hash{$connectid}{$esp_sa}{last_used}));
+#    }
+#  }
 
   # For each tunnel, loop through all ESP SA's and extract data from one most recently used
-  foreach my $connectid (keys %esp_hash) {
-    foreach my $esp_sa (reverse sort {$esp_hash{$a}{last_used} <=> $esp_hash{$b}{last_used}} keys %{$esp_hash{$connectid}}) {
-      foreach my $data (keys %{$esp_hash{$connectid}{$esp_sa}}) {
-        $tunnel_hash{$connectid}->{$data} = $esp_hash{$connectid}{$esp_sa}{$data} if ($data =~ /^_/);
+#  foreach my $connectid (keys %esp_hash) {
+#    foreach my $esp_sa (reverse sort {$esp_hash{$a}{last_used} <=> $esp_hash{$b}{last_used}} keys %{$esp_hash{$connectid}}) {
+#      foreach my $data (keys %{$esp_hash{$connectid}{$esp_sa}}) {
+#        $tunnel_hash{$connectid}->{$data} = $esp_hash{$connectid}{$esp_sa}{$data} if ($data =~ /^_/);
+#      }
+#      my $atime = $tunnel_hash{$connectid}->{_lifetime} - $tunnel_hash{$connectid}->{_expire};
+#      $tunnel_hash{$connectid}->{_state} = "up" if ($atime >= 0);
+#      last;
+#    }
+#  }
+
+  my $cmd = "sudo cat /etc/ipsec.conf";
+  open(my $IPSECCONF, '-|', $cmd);
+  my @ipsecconf = [];
+  while(<$IPSECCONF>){
+    push (@ipsecconf, $_);
+  }
+  for my $line (@ipsecconf) {
+    chomp($line);
+    if ($line =~ m/^conn (peer-(.*)-tunnel-(.*))/) {
+      $connectid = $1;
+      $peerid = $2;
+      $tunnelnum = $3;
+      $peerid = conv_id($peerid);
+      $ikever = 'n/a';
+      $lip = 'n/a';
+      $rip = 'n/a';
+      $lid = 'n/a';
+      $rid = 'n/a';
+      $lsnet = 'n/a';
+      $rsnet = 'n/a';
+    }
+    if ($line =~ m/\skeyexchange=(.*)/) {
+      $ikever = $1;
+      $ikever =~ s/ike/IKE/;
+    }
+    if ($line =~ m/\sleft=(.*)/) {
+      $lip = $1;
+    }
+    if ($line =~ m/\sright=(.*)/) {
+      $rip = $1;
+    }
+    if ($line =~ m/\sleftid=(.*)/) {
+      $lid = $1;
+      $lid =~ s/^\"//;
+      $lid =~ s/\"$//;
+    }
+    if ($line =~ m/\srightid=(.*)/) {
+      $rid = $1;
+      $rid =~ s/^\"//;
+      $rid =~ s/\"$//;
+    }
+    if ($line =~ m/\sleftsubnet=(.*)/) {
+      $lsnet = $1;
+    }
+    if ($line =~ m/\srightsubnet=(.*)/) {
+      $rsnet = $1;
+    }
+    if ($line =~ m/^#conn $connectid$/) {
+      if (not exists $tunnel_hash{$connectid}) {
+        $tunnel_hash{$connectid} = {
+                  _peerid      => $peerid,
+                  _tunnelnum   => $tunnelnum,
+                  _ikever      => $ikever,
+                  _lip         => $lip,
+                  _rip         => $rip,
+                  _lid         => $lid,
+                  _rid         => $rid,
+                  _lsnet       => $lsnet,
+                  _rsnet       => $rsnet,
+                  _lproto      => 'all',
+                  _rproto      => 'all',
+                  _lport       => 'all',
+                  _rport       => 'all',
+                  _lca         => undef,
+                  _rca         => undef,
+                  _newestspi   => 'n/a',
+                  _newestike   => 'n/a',
+                  _encryption  => 'n/a',
+                  _hash        => 'n/a',
+                  _inspi       => 'n/a',
+                  _outspi      => 'n/a',
+                  _pfsgrp      => 'n/a',
+                  _ikeencrypt  => 'n/a',
+                  _ikehash     => 'n/a',
+                  _natt        => 'n/a',
+                  _natsrc      => 'n/a',
+                  _natdst      => 'n/a',
+                  _ikestate    => 'down',
+                  _dhgrp       => 'n/a',
+                  _state       => 'down',
+                  _inbytes     => 'n/a',
+                  _inlastused  => 3600,
+                  _outbytes    => 'n/a',
+                  _outlastused => 3600,
+                  _ikelife     => 'n/a',
+                  _ikeatime    => 'n/a',
+                  _ikeexpire   => 'n/a',
+                  _lifetime    => 'n/a',
+                  _atime       => 'n/a',
+                  _expire      => 'n/a' };
       }
-      my $atime = $tunnel_hash{$connectid}->{_lifetime} - $tunnel_hash{$connectid}->{_expire};
-      $tunnel_hash{$connectid}->{_state} = "up" if ($atime >= 0);
-      last;
     }
   }
 
@@ -995,7 +928,8 @@ sub display_ipsec_sa_brief
                $th{$connectid}->{_hash},
                $th{$connectid}->{_lifetime},
                $th{$connectid}->{_lproto},
-               $th{$connectid}->{_expire});
+               $th{$connectid}->{_expire},
+               $th{$connectid}->{_atime});
       push (@{$tunhash{"$tunnel"}->{_tunnels}}, [ @tmp ]);
       
     }
@@ -1011,11 +945,11 @@ EOH
       print <<EOH;
 
     Tunnel  State  Bytes Out/In   Encrypt  Hash    NAT-T  A-Time  L-Time  Proto
-    ------  -----  -------------  -------  ----    -----  ------  ------  -----
+    ------  -----  -------------  -------  ------  -----  ------  ------  -----
 EOH
       for my $tunnel (tunSort(@{$tunhash{$connid}->{_tunnels}})){
         (my $tunnum, my $state, my $inbytes, my $outbytes, 
-         my $enc, my $hash, my $life, my $proto, my $expire) = @{$tunnel};
+         my $enc, my $hash, my $life, my $proto, my $expire, my $atime) = @{$tunnel};
         my $lip = $tunhash{$connid}->{_lip};
         my $peerip = conv_ip($peerid);
         my $natt = $tunhash{$connid}->{_natt};
@@ -1028,8 +962,6 @@ EOH
           $inbytes = conv_bytes($inbytes);
           $bytesp = "$outbytes/$inbytes";
         }
-        my $atime = $life - $expire;
-        $atime = 0 if ($atime == $life);
         printf "    %-7s %-6s %-14s %-8s %-7s %-6s %-7s %-7s %-2s\n",
               $tunnum, $state, $bytesp, $enc, $hash, $natt, 
               $atime, $life, $proto;
@@ -1083,7 +1015,8 @@ sub display_ipsec_sa_detail
                $th{$connectid}->{_lproto},
                $th{$connectid}->{_rproto},
                $th{$connectid}->{_lport},
-               $th{$connectid}->{_rport} );
+               $th{$connectid}->{_rport},
+               $th{$connectid}->{_atime});
       push (@{$tunhash{$tunnel}->{_tunnels}}, [ @tmp ]);
     }
     for my $connid (peerSort(keys %tunhash)){
@@ -1112,15 +1045,13 @@ sub display_ipsec_sa_detail
         (my $tunnum, my $state, my $inspi, my $outspi, my $enc,
          my $hash, my $pfsgrp, my $srcnet, my $dstnet,
          my $inbytes, my $outbytes, my $life, my $expire, my $lca, 
-         my $rca, my $lproto, my $rproto, my $lport, my $rport) = @{$tunnel};
+         my $rca, my $lproto, my $rproto, my $lport, my $rport, my $atime) = @{$tunnel};
         $enc = conv_enc($enc);
         $hash = conv_hash($hash);
         $lport = 'all' if ($lport eq '0');
         $rport = 'all' if ($rport eq '0');
         $pfsgrp = conv_dh_group($pfsgrp);
         
-        my $atime = $life - $expire;
-        $atime = 0 if ($atime == $life);
         $inbytes = conv_bytes($inbytes);
         $outbytes = conv_bytes($outbytes);
 
@@ -1225,7 +1156,7 @@ sub display_ike_sa_brief {
       my $lip = $th{$connectid}->{_lip};
       $peerid = $th{$connectid}->{_rip};
       my $tunnel = "$peerid-$lip";
-      next if ($th{$connectid}->{_ikestate} eq 'down');
+#      next if ($th{$connectid}->{_ikestate} eq 'down');
       if (not exists $tunhash{$tunnel}) {
         $tunhash{$tunnel}={
           _configpeer => conv_id_rev($th{$connectid}->{_peerid}),
@@ -1240,9 +1171,16 @@ sub display_ike_sa_brief {
                $th{$connectid}->{_dhgrp},
                $th{$connectid}->{_natt},
                $th{$connectid}->{_ikelife},
-               $th{$connectid}->{_ikeexpire} );
-        push (@{$tunhash{$tunnel}->{_tunnels}}, [ @tmp ]);
-      
+               $th{$connectid}->{_ikeexpire},
+               $th{$connectid}->{_ikeatime},
+               $th{$connectid}->{_ikever});
+        if (@{$tunhash{$tunnel}->{_tunnels}} > 0
+          and $tunhash{$tunnel}->{_tunnels}->[0]->[9] > $th{$connectid}->{_ikeatime}) {
+          pop (@{$tunhash{$tunnel}->{_tunnels}});
+        }
+        if (@{$tunhash{$tunnel}->{_tunnels}} == 0) {
+          push (@{$tunhash{$tunnel}->{_tunnels}}, [ @tmp ]);
+        }
     }
     for my $connid (peerSort(keys %tunhash)){
     print <<EOH;
@@ -1255,20 +1193,18 @@ EOH
       print "\n    Description: $desc\n" if (defined($desc));
       print <<EOH;
 
-    State  Encrypt  Hash    D-H Grp  NAT-T  A-Time  L-Time
-    -----  -------  ----    -------  -----  ------  ------
+    State  Version  Encrypt  Hash    D-H Grp  NAT-T  A-Time  L-Time
+    -----  -------  -------  ------  -------  -----  ------  ------
 EOH
       for my $tunnel (tunSort(@{$tunhash{$connid}->{_tunnels}})){
         (my $tunnum, my $state, my $isakmpnum, my $enc, 
-         my $hash, my $dhgrp, my $natt, my $life, my $expire) = @{$tunnel};
+         my $hash, my $dhgrp, my $natt, my $life, my $expire, my $atime, my $ikever) = @{$tunnel};
         $enc = conv_enc($enc);
         $hash = conv_hash($hash);
         $natt = conv_natt($natt);
         $dhgrp = conv_dh_group($dhgrp);
-        my $atime = $life - $expire;
-        $atime = 0 if ($atime == $life);
-        printf "    %-6s %-8s %-7s %-8s %-6s %-7s %-7s\n",
-               $state, $enc, $hash, $dhgrp, $natt, $atime, $life;
+        printf "    %-6s %-8s %-8s %-7s %-8s %-6s %-7s %-7s\n",
+               $state, $ikever, $enc, $hash, $dhgrp, $natt, $atime, $life;
       }
       print "\n \n";
     }

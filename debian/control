@@ -11,6 +11,7 @@ Depends: vyatta-op,
  vyatta-bash | bash (>= 3.1),
  vyatta-cfg-vpn,
  strongswan,
+ strongswan-swanctl,
  ${shlibs:Depends}
 Suggests: util-linux (>= 2.13-5),
  net-tools,
