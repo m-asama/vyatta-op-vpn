@@ -49,10 +49,13 @@ sub clear_tunnel {
   `sudo cp /etc/ipsec.conf /etc/ipsec.conf.bak.\$PPID`;
 
   # remove specific connection from ipsec.conf
-  `sudo sed -i -e '/conn peer-$peer-tunnel-$tunnel/,/#conn peer-$peer-tunnel-$tunnel/d' /etc/ipsec.conf`;
+  `sudo sed -i -e '/conn peer-$peer-tunnel-$tunnel\$/,/#conn peer-$peer-tunnel-$tunnel\$/d' /etc/ipsec.conf`;
 
   # update ipsec connections
   `sudo /usr/sbin/ipsec update >&/dev/null`;
+
+  # down connection
+  `sudo /usr/sbin/ipsec down peer-$peer-tunnel-$tunnel >&/dev/null`;
 
   # sleep for 1/4th of a second for connection to go down
   `sudo sleep 0.25`;
