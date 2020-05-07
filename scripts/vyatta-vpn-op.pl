@@ -66,6 +66,9 @@ sub clear_tunnel {
   # update ipsec connections
   `sudo /usr/sbin/ipsec update >&/dev/null`;
 
+  # up connection
+  `sudo /usr/sbin/ipsec up peer-$peer-tunnel-$tunnel >&/dev/null`;
+
   # sleep for 3/4th of a second for connection to come up
   # this gives us sometime before bringing clearing another tunnel
   `sudo sleep 0.75`;
