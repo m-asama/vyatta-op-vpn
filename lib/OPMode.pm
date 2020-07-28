@@ -214,7 +214,7 @@ sub get_tunnel_info_peer {
   my %tunnel_hash = process_tunnels(\@ipsecstatus);
   my @delkeys = ();
   foreach my $key (keys %tunnel_hash) {
-    push (@delkeys, $key) if $key !~ m/^peer-$peer-/;
+    push (@delkeys, $key) if $key !~ m/^ikev[12]-peer-$peer-/;
   }
   foreach my $key (@delkeys) {
     delete $tunnel_hash{$key};
@@ -291,7 +291,7 @@ sub process_tunnels{
       $inbytes = 'n/a'; $inlastused = 3600; $outbytes = 'n/a'; $outlastused = 3600; $lsnet = 'n/a'; $rsnet = 'n/a';
       $inspi = 'n/a'; $outspi = 'n/a'; $ikelife = 'n/a'; $lifetime = 'n/a';
     }
-    if ($line =~ m/^(peer-(.*)-tunnel-(.*)): #.*, ESTABLISHED, (IKEv(1|2))/) {
+    if ($line =~ m/^(ikev[12]-peer-(.*)-tunnel-(.*)): #.*, ESTABLISHED, (IKEv(1|2))/) {
       $connectid = $1;
       $peerid = $2;
       $tunnelnum = $3;
@@ -381,7 +381,7 @@ sub process_tunnels{
     #   peer-0.0.0.0-tunnel-10: #1, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-256/HMAC_SHA2_256_128/MODP_1024
     if ($line =~ m/^  (\S+): #/) {
       $connectid = undef; $peerid = undef; $tunnelnum = undef;
-      if ($1 !~ m/peer-.*-tunnel-.*/) {
+      if ($1 !~ m/ikev[12]-peer-.*-tunnel-.*/) {
         $ikever = 'n/a';
         $lid = 'n/a'; $lip = 'n/a'; $rid = 'n/a'; $rip = 'n/a'; $natt = 0; $natsrc = 'n/a'; $natdst = 'n/a';
         $ikeencrypt = 'n/a'; $ikehash = 'n/a'; $dhgrp = 'n/a'; $ikeatime = 'n/a'; $ikestate = 'down';
@@ -391,7 +391,7 @@ sub process_tunnels{
       $inbytes = 'n/a'; $inlastused = 3600; $outbytes = 'n/a'; $outlastused = 3600; $lsnet = 'n/a'; $rsnet = 'n/a';
       $inspi = 'n/a'; $outspi = 'n/a'; $ikelife = 'n/a'; $lifetime = 'n/a';
     }
-    if ($line =~ m/^  (peer-(.*)-tunnel-(.*)): #.*, INSTALLED, (TUNNEL(-in-UDP)?), ESP:(.+)/) {
+    if ($line =~ m/^  (ikev[12]-peer-(.*)-tunnel-(.*)): #.*, INSTALLED, (TUNNEL(-in-UDP)?), ESP:(.+)/) {
       $connectid = $1;
       $peerid = $2;
       $tunnelnum = $3;
@@ -513,7 +513,7 @@ sub process_tunnels{
   }
   for my $line (@ipsecconf) {
     chomp($line);
-    if ($line =~ m/^conn (peer-(.*)-tunnel-(.*))/) {
+    if ($line =~ m/^conn (ikev[12]-peer-(.*)-tunnel-(.*))/) {
       $connectid = $1;
       $peerid = $2;
       $tunnelnum = $3;
@@ -635,7 +635,7 @@ sub get_conns
   my %th = ();
   for my $line (@ipsecconf){
     next if ($line =~/^\#/);
-    if ($line =~ /peer-(.*?)-tunnel-(.*)/){
+    if ($line =~ /ikev[12]-peer-(.*?)-tunnel-(.*)/){
       my $peer = $1;
       my $tun = $2;
       if (not exists $th{$peer}){

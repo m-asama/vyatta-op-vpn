@@ -42,6 +42,9 @@ sub clear_tunnel {
   my ($peer, $tunnel) = @_;
   my $error = undef;
   my $cmd = undef;
+
+  my $conn = `egrep '^conn ikev[12]-peer-$peer-tunnel-$tunnel\$' /etc/ipsec.conf | head -1 | cut -d' ' -f2`;
+  chomp($conn);
   
   print "Resetting tunnel $tunnel with peer $peer...\n";
 
@@ -49,13 +52,13 @@ sub clear_tunnel {
   `sudo cp /etc/ipsec.conf /etc/ipsec.conf.bak.\$PPID`;
 
   # remove specific connection from ipsec.conf
-  `sudo sed -i -e '/conn peer-$peer-tunnel-$tunnel\$/,/#conn peer-$peer-tunnel-$tunnel\$/d' /etc/ipsec.conf`;
+  `sudo sed -i -e '/conn $conn\$/,/#conn $conn\$/d' /etc/ipsec.conf`;
 
   # update ipsec connections
   `sudo /usr/sbin/ipsec update >&/dev/null`;
 
   # down connection
-  `sudo /usr/sbin/ipsec down peer-$peer-tunnel-$tunnel >&/dev/null`;
+  `sudo /usr/sbin/ipsec down $conn >&/dev/null`;
 
   # sleep for 1/4th of a second for connection to go down
   `sudo sleep 0.25`;
@@ -67,7 +70,7 @@ sub clear_tunnel {
   `sudo /usr/sbin/ipsec update >&/dev/null`;
 
   # up connection
-  `sudo /usr/sbin/ipsec up peer-$peer-tunnel-$tunnel >&/dev/null`;
+  `sudo /usr/sbin/ipsec up $conn >&/dev/null`;
 
   # sleep for 3/4th of a second for connection to come up
   # this gives us sometime before bringing clearing another tunnel
