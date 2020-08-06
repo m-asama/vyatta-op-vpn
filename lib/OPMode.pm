@@ -193,10 +193,12 @@ sub get_tunnel_info {
   #my $cmd = "cat /home/vyatta/test.txt";
   #my $cmd = "sudo ipsec statusall";
   my $cmd = "sudo swanctl -l";
-  open(my $IPSECSTATUS, ,'-|', $cmd);
   my @ipsecstatus = [];
-  while(<$IPSECSTATUS>){
-    push (@ipsecstatus, $_);
+  if (-e "/var/run/charon.vici") {
+    open(my $IPSECSTATUS, ,'-|', $cmd);
+    while(<$IPSECSTATUS>){
+      push (@ipsecstatus, $_);
+    }
   }
   process_tunnels(\@ipsecstatus);
 }
@@ -206,10 +208,12 @@ sub get_tunnel_info_peer {
   #my $cmd = "cat /home/vyatta/test.txt | grep peer-$peer";
   #my $cmd = "sudo ipsec statusall | grep peer-$peer-";
   my $cmd = "sudo swanctl -l";
-  open(my $IPSECSTATUS, ,'-|', $cmd);
   my @ipsecstatus = [];
-  while(<$IPSECSTATUS>){
-    push (@ipsecstatus, $_);
+  if (-e "/var/run/charon.vici") {
+    open(my $IPSECSTATUS, ,'-|', $cmd);
+    while(<$IPSECSTATUS>){
+      push (@ipsecstatus, $_);
+    }
   }
   my %tunnel_hash = process_tunnels(\@ipsecstatus);
   my @delkeys = ();
