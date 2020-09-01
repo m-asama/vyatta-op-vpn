@@ -383,6 +383,7 @@ sub process_tunnels{
     #   peer-172.16.1.1-tunnel-vti: #5, reqid 3, REKEYED, TUNNEL, ESP:AES_CBC-256/HMAC_SHA2_256_128/MODP_1024
     #   peer-172.16.1.1-tunnel-vti: #6, reqid 3, INSTALLED, TUNNEL, ESP:AES_CBC-256/HMAC_SHA2_256_128/MODP_1024
     #   peer-0.0.0.0-tunnel-10: #1, reqid 1, INSTALLED, TUNNEL-in-UDP, ESP:AES_CBC-256/HMAC_SHA2_256_128/MODP_1024
+    #   ikev1-peer-172.16.1.1-tunnel-0: #202, reqid 2, INSTALLED, TRANSPORT, ESP:AES_CBC-256/HMAC_SHA2_256_128/MODP_1024
     if ($line =~ m/^  (\S+): #/) {
       $connectid = undef; $peerid = undef; $tunnelnum = undef;
       if ($1 !~ m/ikev[12]-peer-.*-tunnel-.*/) {
@@ -395,17 +396,17 @@ sub process_tunnels{
       $inbytes = 'n/a'; $inlastused = 3600; $outbytes = 'n/a'; $outlastused = 3600; $lsnet = 'n/a'; $rsnet = 'n/a';
       $inspi = 'n/a'; $outspi = 'n/a'; $ikelife = 'n/a'; $lifetime = 'n/a';
     }
-    if ($line =~ m/^  (ikev[12]-peer-(.*)-tunnel-(.*)): #.*, INSTALLED, (TUNNEL(-in-UDP)?), ESP:(.+)/) {
+    if ($line =~ m/^  (ikev[12]-peer-(.*)-tunnel-(.*)): #.*, INSTALLED, ((TUNNEL|TRANSPORT)(-in-UDP)?), ESP:(.+)/) {
       $connectid = $1;
       $peerid = $2;
       $tunnelnum = $3;
       $ikelife = get_ikelife($peerid, $tunnelnum);
       $lifetime = get_lifetime($peerid, $tunnelnum);
       $peerid = conv_id($peerid);
-      if ($4 eq 'TUNNEL-in-UDP') {
+      if ($4 eq 'TUNNEL-in-UDP' or $4 eq 'TRANSPORT-in-UDP') {
         $natt = 1;
       }
-      my $algs = $6;
+      my $algs = $7;
       $algs =~ s/\/ESN//;
       if ($algs =~ m/^([^\/\s]+)\/([^\/\s]+)(\/([^\/\s]+))?/) {
         $encryption = conv_enc($1);
